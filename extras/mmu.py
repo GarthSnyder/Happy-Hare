@@ -6807,10 +6807,13 @@ class Mmu:
             try:
                 volumes = list(map(float, purge_volumes.split(',')))
                 n = len(volumes)
+                root_n = math.isqrt(n)
+                is_square_matrix = n == root_n ** 2
+                has_zero_diagonal = is_square_matrix and all([volumes[i * root_n + i] < 0.0001 for i in range(root_n)])
                 num_tools = self.mmu_num_gates
-                if num_tools ** 2 == n:
-                    # Full NxN matrix supplied
-                    self.slicer_tool_map['purge_volumes'] = [volumes[i * num_tools : (i + 1) * num_tools] for i in range(num_tools)]
+                if has_zero_diagonal or n == num_tools ** 2:
+                    # MxM matrix supplied, which may be smaller than num_tools ** 2 if fewer tools are defined in the slicer
+                    self.slicer_tool_map['purge_volumes'] = [volumes[i * root_n : (i + 1) * root_n] for i in range(root_n)]
                 else:
                     if n == 1:
                         calc = lambda x,y: volumes[0] * 2 # Build a single value matrix
@@ -6819,7 +6822,7 @@ class Mmu:
                     elif num_tools * 2 == n:
                         calc = lambda x,y: volumes[x] + volumes[num_tools + y] # Build matrix with sum of unload and load tools
                     else:
-                        raise gcmd.error("Incorrect number of values for PURGE_VOLUMES. Expect 1, %d, %d, or %d, got %d" % (num_tools, num_tools * 2, num_tools ** 2, n))
+                        raise gcmd.error("Incorrect number of values for PURGE_VOLUMES. Expected 1 (constant), %d (one value per tool), %d (load and unload), or a matrix of values with zero diagonal; got %d values" % (num_tools, num_tools * 2, n))
                     self.slicer_tool_map['purge_volumes'] = [
                         [
                             calc(x,y) if x != y else 0
