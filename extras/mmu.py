@@ -6809,9 +6809,9 @@ class Mmu:
                 n = len(volumes)
                 root_n = math.isqrt(n)
                 is_square_matrix = n == root_n ** 2
-                has_zero_diagonal = is_square_matrix and all([volumes[i * root_n + i] < 0.0001 for i in range(root_n)])
+                is_square_with_zero_diagonal = is_square_matrix and all([volumes[i * root_n + i] < 0.0001 for i in range(root_n)])
                 num_tools = self.mmu_num_gates
-                if has_zero_diagonal or n == num_tools ** 2:
+                if is_square_with_zero_diagonal:
                     # MxM matrix supplied, which may be smaller than num_tools ** 2 if fewer tools are defined in the slicer
                     self.slicer_tool_map['purge_volumes'] = [volumes[i * root_n : (i + 1) * root_n] for i in range(root_n)]
                 else:
