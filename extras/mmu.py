@@ -6853,9 +6853,10 @@ class Mmu:
                 msg += "-------------------------------------------"
             if detail:
                 if have_purge_map:
+                    purge_volumes = self.slicer_tool_map['purge_volumes']
                     msg += "\nPurge Volume Map:\n"
-                    msg += "To ->" + UI_SEPARATOR.join("{}T{: <2}".format(UI_SPACE, i) for i in range(self.mmu_num_gates)) + "\n"
-                    msg += '\n'.join(["T{: <2}{}{}".format(i, UI_SEPARATOR, ' '.join(map(lambda x: str(round(x)).rjust(4, UI_SPACE) if x > 0 else "{}{}-{}".format(UI_SPACE, UI_SPACE, UI_SPACE), row))) for i, row in enumerate(self.slicer_tool_map['purge_volumes'])])
+                    msg += "To ->" + UI_SEPARATOR.join("{}T{: <2}".format(UI_SPACE, i) for i in range(len(purge_volumes))) + "\n"
+                    msg += '\n'.join(["T{: <2}{}{}".format(i, UI_SEPARATOR, ' '.join(map(lambda x: str(round(x)).rjust(4, UI_SPACE) if x > 0 else "{}{}-{}".format(UI_SPACE, UI_SPACE, UI_SPACE), row))) for i, row in enumerate(purge_volumes)])
             elif have_purge_map:
                 msg += "\nDETAIL=1 to see purge volumes"
             self._log_always(msg)
