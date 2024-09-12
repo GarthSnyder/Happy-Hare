@@ -4,7 +4,7 @@
 #
 # Copyright (C) 2022  moggieuk#6538 (discord) moggieuk@hotmail.com
 #
-VERSION=2.60 # Important: Keep synced with mmy.py
+VERSION=2.70 # Important: Keep synced with mmy.py
 
 SCRIPT="$(readlink -f "$0")"
 SCRIPTFILE="$(basename "$SCRIPT")"
@@ -650,7 +650,7 @@ read_default_config() {
     parse_file "${SRCDIR}/config/base/mmu_form_tip.cfg"   "variable_" ""        "checkdup"
     parse_file "${SRCDIR}/config/base/mmu_cut_tip.cfg"    "variable_" ""        "checkdup"
     parse_file "${SRCDIR}/config/base/mmu_leds.cfg"       "variable_" ""        "checkdup"
-    for file in `cd ${SRCDIR}/config/addons ; ls *.cfg | grep -v "_hw"`; do
+    for file in `cd ${SRCDIR}/config/addons ; ls *.cfg | grep -v "_hw" | grep -v "my_"`; do
         parse_file "${SRCDIR}/config/addons/${file}"      "variable_" ""        "checkdup"
     done
 }
@@ -688,7 +688,7 @@ read_previous_config() {
         if [ ! "${_param_extruder_homing_current}" == "" ]; then
             _param_extruder_collision_homing_current=${_param_extruder_homing_current}
         fi
-        if [ ! "${_param_log_visual}" == "2" ]; then
+        if [ "${_param_log_visual}" == "2" ]; then
             _param_log_visual=1
         fi
         if [ "${_param_servo_buzz_gear_on_down}" == "" ]; then
@@ -725,6 +725,14 @@ read_previous_config() {
         if [ "${_param_log_file_level}" -gt 2 ]; then
             _param_log_file_level=2
         fi
+
+        if [ ! "${_param_enable_spoolman}" == "" ]; then
+            if [ ! "${_param_enable_spoolman}" == "1" ]; then
+                _param_spoolman_support="readonly"
+            else
+                _param_spoolman_support="off"
+            fi
+        fi
     fi
 
     cfg="mmu_filametrix.cfg"
@@ -734,7 +742,7 @@ read_previous_config() {
         echo -e "${INFO}Reading ${cfg} configuration from previous installation..."
         parse_file "${dest_cfg}" "variable_"
 
-        # Convert from mm/min to mm/sec and 'spd' to 'speed' for consistency in other macros
+        # Hack to convert from mm/min to mm/sec and 'spd' to 'speed' for consistency in other macros
         #
         if [ ! "${variable_rip_speed}" == "" ]; then
             variable_rip_speed=$(echo "$variable_rip_speed" | awk '{if ($1 > 250) print int($1 / 60); else print $1}')
@@ -746,10 +754,10 @@ read_previous_config() {
             variable_extruder_move_speed=$(echo "$variable_extruder_move_speed" | awk '{if ($1 > 250) print int($1 / 60); else print $1}')
         fi
         if [ ! "${variable_travel_spd}" == "" ]; then
-            variable_travel_speed=$(echo "$variable_travel_spd" | awk '{if ($1 > 250) print int($1 / 60); else print $1}')
+            variable_travel_speed=$(echo "$variable_travel_spd" | awk '{if ($1 > 300) print int($1 / 60); else print $1}')
         fi
         if [ ! "${variable_cut_fast_move_spd}" == "" ]; then
-            variable_cut_fast_move_speed=$(echo "$variable_cut_fast_move_spd" | awk '{if ($1 > 250) print int($1 / 60); else print $1}')
+            variable_cut_fast_move_speed=$(echo "$variable_cut_fast_move_spd" | awk '{if ($1 > 300) print int($1 / 60); else print $1}')
         fi
         if [ ! "${variable_cut_slow_move_spd}" == "" ]; then
             variable_cut_slow_move_speed=$(echo "$variable_cut_slow_move_spd" | awk '{if ($1 > 250) print int($1 / 60); else print $1}')
@@ -1043,7 +1051,8 @@ copy_config_files() {
     fi
 
     # Addon config files are always copied (and updated) so they can be edited ----------------
-    for file in `cd ${SRCDIR}/config/addons ; ls *.cfg`; do
+    # Skipping files with 'my_' prefix for development
+    for file in `cd ${SRCDIR}/config/addons ; ls *.cfg | grep -v "my_"`; do
         src=${SRCDIR}/config/addons/${file}
         dest=${mmu_dir}/addons/${file}
         if [ -f "${dest}" ]; then
@@ -1862,9 +1871,12 @@ else
 fi
 
 if [ "$INSTALL" -eq 0 ]; then
+#    if [ "$VERSION" == "2.70" ]; then
+#        restart_moonraker
+#    fi
     restart_klipper
 else
-    echo -e "${WARNING}Klipper not restarted automatically because you need to validate and complete config"
+    echo -e "${WARNING}Klipper not restarted automatically because you need to validate and complete config first"
 fi
 
 if [ "$UNINSTALL" -eq 0 ]; then
