@@ -91,7 +91,7 @@ PURGE_VOLUMES_REGEX = r"^; (flush_volumes_matrix|wiping_volumes_matrix) =(.*)$" 
 METADATA_PURGE_VOLUMES = "!purge_volumes!"
 
 # Detection for next pos processing
-T_PATTERN  = r'^T(\d+)$'
+T_PATTERN  = r'^T(\d+)\s*(?:;.*)?$'
 G1_PATTERN = r'^G[01](?:\s+X([\d.]*)|\s+Y([\d.]*))+.*$'
 
 def gcode_processed_already(file_path):
