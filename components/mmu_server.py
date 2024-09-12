@@ -13,9 +13,6 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 #
 from __future__ import annotations
-import copy
-from distutils import version
-from distutils.command import check
 import json
 import logging, os, sys, re, time, asyncio
 import runpy, argparse, shutil, traceback, tempfile, filecmp
@@ -43,7 +40,7 @@ if TYPE_CHECKING:
 
 MMU_NAME_FIELD   = 'printer_name'
 MMU_GATE_FIELD   = 'mmu_gate_map'
-MIN_SM_VER       = version.LooseVersion('0.18.1')
+MIN_SM_VER       = (0, 18, 1)
 
 DB_NAMESPACE     = "moonraker"
 ACTIVE_SPOOL_KEY = "spoolman.spool_id"
@@ -53,7 +50,10 @@ class MmuServer:
         self.config = config
         self.server = config.get_server()
         self.printer_info = self.server.get_host_info()
-        self.spoolman: SpoolManager = self.server.load_component(config, "spoolman", None)
+        self.spoolman = None
+        if config.has_section("spoolman"): # Avoid exception if spoolman not configured
+            self.spoolman: SpoolManager = self.server.load_component(config, "spoolman", None)
+        self.spoolman: SpoolManager = self.server.lookup_component("spoolman", None)
         self.klippy_apis: APIComp = self.server.lookup_component("klippy_apis")
         self.http_client: HttpClient = self.server.lookup_component("http_client")
 
@@ -61,19 +61,20 @@ class MmuServer:
         # Example: {2: ('BigRed', 0, {"material": "pla", "color": "ff56e0"}), 3: ('BigRed', 3, {"material": "abs"}), ...
         self.spool_location = {}
 
-        self.nb_gates = None             # Set by Happy Hare on first call
+        self.nb_gates = None             # Set during initialization to the size of the MMU or 1 if standalone
         self.cache_lock = asyncio.Lock() # Lock to serialize a async calls for Happy Hare
 
         # Spoolman filament info retrieval functionality and update reporting
-        self.server.register_remote_method("spoolman_refresh", self.refresh_cache)
-        self.server.register_remote_method("spoolman_get_filaments", self.get_filaments) # "get" mode
-        self.server.register_remote_method("spoolman_push_gate_map", self.push_gate_map) # "push" mode
-        self.server.register_remote_method("spoolman_pull_gate_map", self.pull_gate_map) # "pull" mode
-        self.server.register_remote_method("spoolman_clear_spools_for_printer", self.clear_spools_for_printer)
-        self.server.register_remote_method("spoolman_set_spool_gate", self.set_spool_gate)
-        self.server.register_remote_method("spoolman_unset_spool_gate", self.unset_spool_gate)
-        self.server.register_remote_method("spoolman_get_spool_info", self.display_spool_info)
-        self.server.register_remote_method("spoolman_display_spool_location", self.display_spool_location)
+        if self.spoolman:
+            self.server.register_remote_method("spoolman_refresh", self.refresh_cache)
+            self.server.register_remote_method("spoolman_get_filaments", self.get_filaments) # "get" mode
+            self.server.register_remote_method("spoolman_push_gate_map", self.push_gate_map) # "push" mode
+            self.server.register_remote_method("spoolman_pull_gate_map", self.pull_gate_map) # "pull" mode
+            self.server.register_remote_method("spoolman_clear_spools_for_printer", self.clear_spools_for_printer)
+            self.server.register_remote_method("spoolman_set_spool_gate", self.set_spool_gate)
+            self.server.register_remote_method("spoolman_unset_spool_gate", self.unset_spool_gate)
+            self.server.register_remote_method("spoolman_get_spool_info", self.display_spool_info)
+            self.server.register_remote_method("spoolman_display_spool_location", self.display_spool_location)
 
         # Replace file_manager/metadata with this file
         self.setup_placeholder_processor(config)
@@ -81,7 +82,7 @@ class MmuServer:
         # Options
         self.update_location = self.config.getboolean("update_spoolman_location", True)
 
-    async def _get_spoolman_version(self) -> version.LooseVersion:
+    async def _get_spoolman_version(self) -> tuple[int, int, int] | None:
         response = await self.http_client.get(url=f'{self.spoolman.spoolman_url}/v1/info')
         if response.status_code == 404:
             logging.info(f"'{self.spoolman.spoolman_url}/v1/info' not found")
@@ -92,30 +93,62 @@ class MmuServer:
             return False
         else:
             logging.info("info field in spoolman retrieved")
-            return version.LooseVersion(response.json()['version'])
+            return tuple([int(n) for n in response.json()['version'].split('.')])
 
     async def component_init(self) -> None:
+        if self.spoolman is None:
+            logging.warning("Spoolman not available. Happy Hare remote methods not available")
+            return
+
+        # Get current printer hostname
+        self.printer_hostname = self.printer_info["hostname"]
+        self.spoolman_has_extras = False
+        asyncio.create_task(self._init_spoolman(retry=3)) # Spoolman may start up after us so retry a few times
+
+    async def _init_spoolman(self, retry=1) -> bool:
+        '''
+        Return True if connected, False if not. Set's self.spoolman_has_extras is
+        '''
         async with self.cache_lock:
-            # Get current printer hostname
-            self.printer_hostname = self.printer_info["hostname"]
-            self.spoolman_version = await self._get_spoolman_version()
+            for _ in range(retry):
+                self.spoolman_version = await self._get_spoolman_version()
+                if self.spoolman_version:
+                    logging.info(f"Contacted Spoolman")
+                    break
+                logging.warning(f"Spoolman not available. {'Retrying in 2 seconds...' if retry > 1 else ''}")
+                await asyncio.sleep(2)
+
             extras = False
-            if self.spoolman_version >= MIN_SM_VER:
+            if self.spoolman_version and self.spoolman_version >= MIN_SM_VER:
                 # Make sure db has required extra fields
                 extras = True
                 fields = await self._get_extra_fields("spool")
                 if MMU_NAME_FIELD not in fields:
                     extras = extras and await self._add_extra_field("spool", field_name="Printer Name", field_key=MMU_NAME_FIELD, field_type="text", default_value="")
-                if MMU_GATE_FIELD not in await self._get_extra_fields("spool"):
-                    extras = extras and await self._add_extra_field("spool", field_name="MMU Gate", field_key=MMU_GATE_FIELD, field_type="integer", default_value=None)
-            else:
+                if MMU_GATE_FIELD not in fields:
+                    extras = extras and await self._add_extra_field("spool", field_name="MMU Gate", field_key=MMU_GATE_FIELD, field_type="integer", default_value=-1)
+
+                # Create cache of spool location from Spoolman db for effeciency
+                if extras:
+                    await self._build_spool_location_cache(silent=True)
+                self.spoolman_has_extras = extras
+
+            elif self.spoolman_version:
                 logging.error(f"Could not initialize Spoolman db for Happy Hare. Spoolman db version too old (found {self.spoolman_version} < {MIN_SM_VER})")
+            else:
+                logging.error(f"Could not connect to Spoolman db. Perhaps it is not initialized yet? Will try again on next request")
+                return False
+        return True
 
-            # Create cache of spool location from spoolman db for effeciency
-            if extras:
-                await self._build_spool_location_cache(silent=True)
-            self.spoolman_has_extras = extras
-
+    async def _check_init_spoolman(self, silent=False) -> bool:
+        if not self.spoolman_has_extras:
+            db_awake = await self._init_spoolman()
+            if not silent:
+                if not db_awake:
+                    await self._log_n_send(f"Couldn't connect to Spoolman. Maybe not configured/running yet (check moonraker.log).\nUse MMU_SPOOLMAN REFRESH=1 to force retry")
+                elif not self.spoolman_has_extras:
+                    await self._log_n_send(f"Incompatible Spoolman version for this feature. Check moonraker.log")
+        return self.spoolman_has_extras
 
     # !TODO: implement mainsail/fluidd gui prompts?
     async def _log_n_send(self, msg, error=False, prompt=False, silent=False):
@@ -127,23 +160,52 @@ class MmuServer:
         else:
             logging.info(msg)
         if not silent:
-            error_flag = "ERROR=1" if error else ""
-            msg = msg.replace("\n", "\\n") # Get through klipper filtering
-            await self.klippy_apis.run_gcode(f"MMU_LOG MSG='{msg}' {error_flag}")
+            if self._mmu_backend_enabled():
+                error_flag = "ERROR=1" if error else ""
+                msg = msg.replace("\n", "\\n") # Get through klipper filtering
+                await self.klippy_apis.run_gcode(f"MMU_LOG MSG='{msg}' {error_flag}")
+            else:
+                for msg in msg.split("\n"):
+                    await self.klippy_apis.run_gcode(f"M118 {msg}")
+                if error :
+                    await self.klippy_apis.pause_print()
 
-    def _initialize_mmu(self, nb_gates):
+    async def _init_mmu_backend(self):
         '''
-        Initialize mmu gate map if not already done
+        Initialize MMU backend and check if enabled
 
-        parameters:
-            @param nb_gates: number of gates on the MMU
         returns:
             @return: True if initialized, False otherwise
         '''
-        if not self.nb_gates:
-            if not nb_gates:
-                return False
-            self.nb_gates = nb_gates
+        self.mmu_backend_present = 'mmu' in await self.klippy_apis.get_object_list()
+        if self.mmu_backend_present:
+            self.mmu_backend_config = await self.klippy_apis.query_objects({"mmu": None})
+            self.mmu_enabled = self.mmu_backend_config.get('mmu', {}).get('enabled', False)
+        else:
+            self.mmu_enabled = False
+        logging.info(f"MMU backend present: {self.mmu_backend_present}")
+        logging.info(f"MMU backend enabled: {self.mmu_enabled}")
+        return True
+
+    def _mmu_backend_enabled(self):
+        if not hasattr(self, 'mmu_backend_present'):
+            return False
+        return self.mmu_backend_present and self.mmu_enabled
+
+    async def _initialize_mmu(self):
+        '''
+        Initialize mmu gate map if not already done
+
+        returns:
+            @return: True once initialized
+        '''
+        if not hasattr(self, 'mmu_backend_present'):
+            await self._init_mmu_backend()
+            if self._mmu_backend_enabled():
+                self.nb_gates = self.mmu_backend_config.get('mmu', {}).get('num_gates', 0)
+            else:
+                self.nb_gates = 1 # for standalone usage (no mmu backend considering standard printer setup)
+            logging.info(f"MMU num_gates: {self.nb_gates}")
         return True
 
     async def _get_extra_fields(self, entity_type) -> bool:
@@ -160,17 +222,16 @@ class MmuServer:
             return False
         else:
             logging.info(f"Extra fields for {entity_type} found")
-            return [r['name'] for r in response.json()]
-        return True
+            return [r['key'] for r in response.json()]
 
     async def _add_extra_field(self, entity_type, field_key, field_name, field_type, default_value) -> bool:
         '''
-        Helper to add a new field to the extra field of the spoolman db
+        Helper to add a new field to the extra field of the Spoolman db
         '''
-        default_value = json.dumps(default_value) if field_type == 'text' else default_value
+        #default_value = json.dumps(default_value) if field_type == 'text' else default_value
         response = await self.http_client.post(
             url=f'{self.spoolman.spoolman_url}/v1/field/{entity_type}/{field_key}',
-            body={"name" : field_name, "field_type" : field_type, "default_value" : default_value}
+            body={"name" : field_name, "field_type" : field_type, "default_value" : json.dumps(default_value)}
         )
         if response.status_code == 404:
             logging.info(f"'{self.spoolman.spoolman_url}/v1/field/spool/{field_key}' not found")
@@ -179,8 +240,8 @@ class MmuServer:
             err_msg = self.spoolman._get_response_error(response)
             logging.error(f"Attempt add field {field_name} failed: {err_msg}")
             return False
-        logging.info(f"Field {field_name} added to spoolman db for entity type {entity_type}")
-        logging.info(f"  -fields: %s", response.json())
+        logging.info(f"Field {field_name} added to Spoolman db for entity type {entity_type}")
+        logging.info("  -fields: %s", response.json())
         return True
 
     async def _fetch_spool_info(self, spool_id) -> dict | None:
@@ -211,9 +272,9 @@ class MmuServer:
 
     async def _build_spool_location_cache(self, fix=False, silent=False) -> bool:
         '''
-        Helper to get all spools and gates assigned to printers from spoolman db and cache them
+        Helper to get all spools and gates assigned to printers from Spoolman db and cache them
         '''
-        logging.info("Building spool location cache from spoolman db")
+        logging.info("Building spool location cache from Spoolman db")
         try:
             self.spool_location.clear()
             # Fetch all spools
@@ -254,8 +315,8 @@ class MmuServer:
 
         if errors:
             if fix:
-                errors += f"\nWill attempt to fix..."
-            await self._log_n_send(f"Warning - Inconsistencies found in spoolman db:{errors}", silent=silent)
+                errors += "\nWill attempt to fix..."
+            await self._log_n_send(f"Warning - Inconsistencies found in Spoolman db:{errors}", silent=silent)
 
         if fix:
             tasks = {sid: self._unset_spool_gate(sid, silent=silent) for sid in sids_to_fix}
@@ -285,38 +346,37 @@ class MmuServer:
         ]
 
     async def _set_spool_gate(self, spool_id, printer, gate, silent=False) -> bool:
-        if not self.spoolman_has_extras: return
+        if not await self._check_init_spoolman(): return
 
         # Use the PATCH method on the spoolman api
         if not silent:
             logging.info(f"Setting spool {spool_id} for printer {printer} @ gate {gate}")
-        if self.spoolman_has_extras:
-            data = {'extra': {MMU_NAME_FIELD: f"\"{printer}\"", MMU_GATE_FIELD: gate}}
-            if self.update_location:
-                data['location'] = f"{printer} @ MMU Gate:{gate}"
-            response = await self.http_client.request(
-                method="PATCH",
-                url=f"{self.spoolman.spoolman_url}/v1/spool/{spool_id}",
-                body=json.dumps(data)
-            )
-            if response.status_code == 404:
-                logging.error(f"'{self.spoolman.spoolman_url}/v1/spool/{spool_id}' not found")
-                await self._log_n_send(f"SpoolId {spool_id} not found", error=True, silent=False)
-                return False
-            elif response.has_error():
-                err_msg = self.spoolman._get_response_error(response)
-                logging.error(f"Attempt to set spool failed: {err_msg}")
-                await self._log_n_send(f"Failed to set spool {spool_id} for printer {printer}", error=True, silent=False)
-                return False
+        data = {'extra': {MMU_NAME_FIELD: json.dumps(f"{printer}"), MMU_GATE_FIELD: json.dumps(gate)}}
+        if self.update_location:
+            data['location'] = f"{printer} @ MMU Gate:{gate}"
+        response = await self.http_client.request(
+            method="PATCH",
+            url=f"{self.spoolman.spoolman_url}/v1/spool/{spool_id}",
+            body=json.dumps(data)
+        )
+        if response.status_code == 404:
+            logging.error(f"'{self.spoolman.spoolman_url}/v1/spool/{spool_id}' not found")
+            await self._log_n_send(f"SpoolId {spool_id} not found", error=True, silent=False)
+            return False
+        elif response.has_error():
+            err_msg = self.spoolman._get_response_error(response)
+            logging.error(f"Attempt to set spool failed: {err_msg}")
+            await self._log_n_send(f"Failed to set spool {spool_id} for printer {printer}. Look at moonraker.log for more details.", error=True, silent=False)
+            return False
         return True
 
     async def _unset_spool_gate(self, spool_id, silent=False) -> bool:
-        if not self.spoolman_has_extras: return
+        if not await self._check_init_spoolman(): return
 
         # Use the PATCH method on the spoolman api
         if not silent:
             logging.info(f"Unsetting gate map on spool id {spool_id}")
-        data = {'extra': {MMU_NAME_FIELD: "\"\"", MMU_GATE_FIELD: -1}}
+        data = {'extra': {MMU_NAME_FIELD: json.dumps(""), MMU_GATE_FIELD: json.dumps(-1)}}
         if self.update_location:
             data['location'] = ""
         response = await self.http_client.request(
@@ -331,54 +391,60 @@ class MmuServer:
         elif response.has_error():
             err_msg = self.spoolman._get_response_error(response)
             logging.error(f"Attempt to unset spool failed: {err_msg}")
-            await self._log_n_send(f"Failed to unset spool {spool_id}", error=True, silent=False)
+            await self._log_n_send(f"Failed to unset spool {spool_id}. Look at moonraker.log for more details", error=True, silent=False)
             return False
         return True
 
     async def _send_gate_map_update(self, gate_ids, replace=False, silent=False) -> bool:
         '''
         Retrieve filament attributes for list of (gate, spool_id) tuples
-        Pass back to Happy Hare
+        Pass back to Happy Hare.
+
+        If not mmu backend has been detected, ignore the request
         '''
-        gate_dict = {
-            gate: {'spool_id': -1} if spool_id < 0 else (
-                spool[2].copy() if (spool := self.spool_location.get(spool_id)) else logging.error(f"Spool id {spool_id} requested but not found in spoolman")
-            )
-            for gate, spool_id in gate_ids
-        }
-        try:
-            await self.klippy_apis.run_gcode(f"MMU_GATE_MAP MAP=\"{gate_dict}\" {'REPLACE=1' if replace else ''} QUIET=1")
-        except Exception as e:
-            await self._log_n_send(f"Exception running MMU_GATE_MAP gcode: {str(e)}", error=True, silent=silent)
-            return False
+        if self._mmu_backend_enabled():
+            gate_dict = {
+                gate: (
+                    {'spool_id': -1} if spool_id < 0 else
+                    self.spool_location.get(spool_id)[2].copy()
+                    if self.spool_location.get(spool_id)
+                    else logging.error(f"Spool id {spool_id} requested but not found in spoolman")
+                )
+                for gate, spool_id in gate_ids
+            }
+            try:
+                await self.klippy_apis.run_gcode(f"MMU_GATE_MAP MAP=\"{gate_dict}\" {'REPLACE=1' if replace else ''} QUIET=1")
+            except Exception as e:
+                await self._log_n_send(f"Exception running MMU_GATE_MAP gcode: {str(e)}", error=True, silent=silent)
+                return False
         return True
 
-    async def refresh_cache(self, nb_gates=None, fix=False, silent=False) -> bool:
+    async def refresh_cache(self, fix=False, silent=False) -> bool:
         '''
         Rebuilds the local cache of essential spool information
         '''
+        if not await self._check_init_spoolman(): return
         async with self.cache_lock:
-            if not self._initialize_mmu(nb_gates):
-                return False
+            await self._initialize_mmu()
             return await self._build_spool_location_cache(fix=fix, silent=silent)
 
     async def get_filaments(self, gate_ids, silent=False) -> bool:
         '''
         Retrieve filament attributes for list of (gate, spool_id) tuples
-        Pass back to Happy Hare
+        Pass back to Happy Hare. Does not require extended Spoolman db
         '''
         async with self.cache_lock:
             return await self._send_gate_map_update(gate_ids, silent=silent)
 
-    async def push_gate_map(self, gate_ids=None, nb_gates=None, silent=False) -> bool:
+    async def push_gate_map(self, gate_ids=None, silent=False) -> bool:
         '''
         Store the gate map for the printer for a list of (gate, spool_id) tuples.
         This attempts to reduce the number of necessary tasks and then run them in parallel
         Then updates Happy Hare with filament attributes
         '''
+        if not await self._check_init_spoolman(): return
         async with self.cache_lock:
-            if not self._initialize_mmu(nb_gates):
-                return False
+            await self._initialize_mmu()
 
             if not gate_ids:
                 logging.error("Gate spool id mapping not provided or empty")
@@ -403,13 +469,13 @@ class MmuServer:
                     if p_name == self.printer_hostname and not any(s == spool_id for _, s in gate_ids):
                         updates[spool_id] = -1
 
-            # Create minimal set of async tasks to update spoolman db and run them in parallel
+            # Create minimal set of async tasks to update Spoolman db and run them in parallel
             tasks = {
                 sid: (
-                    self._unset_spool_gate(sid, silent=silent), 
+                    self._unset_spool_gate(sid, silent=silent),
                     None
                 ) if updates[sid] < 0 else (
-                    self._set_spool_gate(sid, self.printer_hostname, updates[sid], silent=silent), 
+                    self._set_spool_gate(sid, self.printer_hostname, updates[sid], silent=silent),
                     updates[sid]
                 )
                 for sid in updates.keys()
@@ -424,40 +490,40 @@ class MmuServer:
                     if updates[sid] < 0: # 'unset' case
                         self.spool_location[sid] = ('', -1, filament_attr)
                         self.server.send_event("spoolman:unset_spool_gate", {"spool_id": sid, "printer": old_printer, "gate": old_gate})
-                        await self._log_n_send(f"Spool {sid} cleared of printer {old_printer} and gate {old_gate} in spoolman db", silent=silent)
+                        await self._log_n_send(f"Spool {sid} cleared of printer {old_printer} and gate {old_gate} in Spoolman db", silent=silent)
                     else: # 'set' case
                         self.spool_location[sid] = (self.printer_hostname, gate, filament_attr)
                         self.server.send_event("spoolman:set_spool_gate", {"spool_id": sid, "printer": self.printer_hostname, "gate": gate})
-                        await self._log_n_send(f"Spool {sid} set for printer {self.printer_hostname} @ gate {gate} in spoolman db", silent=silent)
+                        await self._log_n_send(f"Spool {sid} set for printer {self.printer_hostname} @ gate {gate} in Spoolman db", silent=silent)
 
             # Send update of filament attributes back to Happy Hare
             return await self._send_gate_map_update(gate_ids, silent=silent)
 
-    async def pull_gate_map(self, nb_gates=None, silent=False) -> bool:
+    async def pull_gate_map(self, silent=False) -> bool:
         '''
-        Get all spools assigned to the current printer from spoolman db and map them to gates
+        Get all spools assigned to the current printer from Spoolman db and map them to gates
         Pass back to Happy Hare
         '''
+        if not await self._check_init_spoolman(): return
         async with self.cache_lock:
-            if not self._initialize_mmu(nb_gates):
-                return False
+            await self._initialize_mmu()
 
             gate_ids = [(gate, self._find_first_spool_id(self.printer_hostname, gate)) for gate in range(self.nb_gates)]
             return await self._send_gate_map_update(gate_ids, replace=True, silent=silent)
 
-    async def clear_spools_for_printer(self, printer=None, nb_gates=None, sync=False, silent=False) -> bool:
+    async def clear_spools_for_printer(self, printer=None, sync=False, silent=False) -> bool:
         '''
         Clears all gates for the printer
         '''
+        if not await self._check_init_spoolman(): return
         async with self.cache_lock:
-            if not self._initialize_mmu(nb_gates):
-                return False
+            await self._initialize_mmu()
 
             printer_name = printer or self.printer_hostname
             if not silent:
                 logging.info(f"Clearing gate map for printer: {printer_name}")
 
-            # Create minimal set of async tasks to update spoolman db and run them in parallel
+            # Create minimal set of async tasks to update Spoolman db and run them in parallel
             old_sids = self._find_all_spool_ids(printer_name, None)
             tasks = {sid: self._unset_spool_gate(sid, silent=silent) for sid in old_sids}
             results = await asyncio.gather(*tasks.values())
@@ -479,7 +545,7 @@ class MmuServer:
                 return await self._send_gate_map_update(gate_ids, replace=True, silent=silent)
             return True
 
-    async def set_spool_gate(self, spool_id=None, gate=None, nb_gates=None, sync=False, silent=False) -> bool:
+    async def set_spool_gate(self, spool_id=None, gate=None, sync=False, silent=False) -> bool:
         '''
         Associate spool_id with the printer and gate and clear up any old associations
 
@@ -488,17 +554,17 @@ class MmuServer:
             @param gate: optional gate number to set the spool into. If not provided (and not an mmu), the spool will be set into gate 0.
         returns:
             @return: True if successful, False otherwise
-        Removes the printer + gate allocation in spoolman db for gate (if supplied)
+        Removes the printer + gate allocation in Spoolman db for gate (if supplied)
         '''
+        if not await self._check_init_spoolman(): return
         async with self.cache_lock:
-            if not self._initialize_mmu(nb_gates):
-                return False
+            await self._initialize_mmu()
 
             # Sanity checking...
             if gate is not None and gate < 0:
                 await self._log_n_send("Trying to set spool {spool_id} for printer {self.printer_hostname} but gate {gate} is invalid.", error=True, silent=silent)
                 return False
-            if gate is not None and gate > self.nb_gates:
+            if gate is not None and gate > self.nb_gates - 1:
                 await self._log_n_send(f"Trying to set spool {spool_id} for printer {self.printer_hostname} @ gate {gate} but only {self.nb_gates} gates are available. Please check the spoolman or moonraker [spoolman] setup.", error=True, silent=silent)
                 return False
             if gate is None:
@@ -510,9 +576,8 @@ class MmuServer:
             if not silent:
                 logging.info(f"Attempting to set gate {gate} for printer {self.printer_hostname}")
 
-            # Create minimal set of async tasks to update spoolman db and run them
+            # Create minimal set of async tasks to update Spoolman db and run them in parallel
             old_sids = self._find_all_spool_ids(self.printer_hostname, gate)
-
             tasks = {
                 sid: (self._unset_spool_gate(sid, silent=silent), None)
                 for sid in old_sids if sid != spool_id
@@ -532,7 +597,7 @@ class MmuServer:
                             updated_gate_ids[old_gate] = -1
                         self.spool_location[sid] = ('', -1, filament_attr)
                         self.server.send_event("spoolman:unset_spool_gate", {"spool_id": sid, "printer": old_printer, "gate": old_gate})
-                        await self._log_n_send(f"Spool {sid} cleared of printer {old_printer} and gate {old_gate} in spoolman db", silent=silent)
+                        await self._log_n_send(f"Spool {sid} cleared of printer {old_printer} and gate {old_gate} in Spoolman db", silent=silent)
                     else:
                         # 'set' case
                         if 0 <= gate < self.nb_gates:
@@ -541,7 +606,7 @@ class MmuServer:
                             updated_gate_ids[gate] = sid
                         self.spool_location[sid] = (self.printer_hostname, gate, filament_attr)
                         self.server.send_event("spoolman:set_spool_gate", {"spool_id": sid, "printer": self.printer_hostname, "gate": gate})
-                        await self._log_n_send(f"Spool {sid} set for printer {self.printer_hostname} @ gate {gate} in spoolman db", silent=silent)
+                        await self._log_n_send(f"Spool {sid} set for printer {self.printer_hostname} @ gate {gate} in Spoolman db", silent=silent)
 
             # Sync with Happy Hare if required
             if sync and updated_gate_ids:
@@ -549,17 +614,17 @@ class MmuServer:
                 return await self._send_gate_map_update(gate_ids, replace=True, silent=silent)
             return True
 
-    async def unset_spool_gate(self, spool_id=None, gate=None, nb_gates=None, sync=False, silent=False) -> bool:
+    async def unset_spool_gate(self, spool_id=None, gate=None, sync=False, silent=False) -> bool:
         '''
-        Removes the printer + gate allocation in spoolman db for gate or spool_id (if supplied)
+        Removes the printer + gate allocation in Spoolman db for gate or spool_id (if supplied)
         '''
+        if not await self._check_init_spoolman(): return
         async with self.cache_lock:
-            if not self._initialize_mmu(nb_gates):
-                return False
+            await self._initialize_mmu()
 
             # Sanity checking...
             if spool_id is None and gate is None:
-                await self._log_n_send(f"Trying to unset spool but no spool_id or gate provided", error=True, silent=silent)
+                await self._log_n_send("Trying to unset spool but no spool_id or gate provided", error=True, silent=silent)
                 return False
             if spool_id is not None and gate is not None:
                 await self._log_n_send(f"Trying to unset spool but both spool_id {spool_id} and gate {gate} provided. Only one or the other expected", error=True, silent=silent)
@@ -569,7 +634,7 @@ class MmuServer:
                     await self._log_n_send(f"Trying to unset spool {spool_id} but not found in cache. Perhaps try refreshing cache", error=True, silent=silent)
                     return False
 
-            # Create minimal set of async tasks to update spoolman db and run them
+            # Create minimal set of async tasks to update Spoolman db and run them in parallel
             sids = self._find_all_spool_ids(self.printer_hostname, gate) if gate is not None else [spool_id]
             tasks = {sid: self._unset_spool_gate(sid, silent=silent) for sid in sids}
             results = await asyncio.gather(*tasks.values())
@@ -583,7 +648,7 @@ class MmuServer:
                         updated_gate_ids[old_gate] = -1
                     self.spool_location[sid] = ('', -1, filament_attr)
                     self.server.send_event("spoolman:unset_spool_gate", {"spool_id": sid, "old_printer": self.printer_hostname, "old_gate": gate})
-                    await self._log_n_send(f"Spool {sid} cleared of printer {old_printer} and gate {old_gate} in spoolman db", silent=silent)
+                    await self._log_n_send(f"Spool {sid} cleared of printer {old_printer} and gate {old_gate} in Spoolman db", silent=silent)
 
             # Sync with Happy Hare if required
             if sync and updated_gate_ids:
@@ -593,7 +658,7 @@ class MmuServer:
 
     async def display_spool_info(self, spool_id: int | None = None):
         '''
-        Gets info for active spool id and sends it to the klipper console
+        Gets info for active spool id and sends it to the klipper console. Does not require Spoolman db extension
         '''
         async with self.cache_lock:
             active = "Spool"
@@ -634,12 +699,13 @@ class MmuServer:
             await self._log_n_send(msg)
             return True
 
-    async def display_spool_location(self, printer=None, nb_gates=None):
+    async def display_spool_location(self, printer=None):
         '''
         Builds a sorted table of gate to spool association for the specified printer and sends to klipper console
         '''
+        if not await self._check_init_spoolman(): return
         async with self.cache_lock:
-            self._initialize_mmu(nb_gates)
+            await self._initialize_mmu()
             printer_name = printer or self.printer_hostname
             filtered = sorted(((spool_id, gate) for spool_id, (printer, gate, _) in self.spool_location.items() if printer == printer_name), key=lambda x: x[1])
             if filtered:
@@ -690,9 +756,9 @@ METADATA_TOOL_DISCOVERY = "!referenced_tools!"
 
 # PS/SS uses "extruder_colour", Orca uses "filament_colour" but extruder_colour can exist with empty or single color
 COLORS_REGEX = {
-    'PrusaSlicer' : r"^;\s*extruder_colour\s*=\s*(#.*;.*)$",
-    'SuperSlicer' : r"^;\s*extruder_colour\s*=\s*(#.*;.*)$",
-    'OrcaSlicer' : r"^;\s*filament_colour\s*=\s*(#.*;.*)$"
+    'PrusaSlicer' : r"^;\s*extruder_colour\s*=\s*(#.*;*.*)$",
+    'SuperSlicer' : r"^;\s*extruder_colour\s*=\s*(#.*;*.*)$",
+    'OrcaSlicer' : r"^;\s*filament_colour\s*=\s*(#.*;*.*)$"
 }
 METADATA_COLORS = "!colors!"
 
