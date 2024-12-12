@@ -289,7 +289,7 @@ class LinearSelector:
             if force_unload is True:
                 # Forced unload case for recovery
                 self.mmu.unload_sequence(check_state=True)
-            elif force_unload is False and self.mmu.filament_pos != self.mmu.FILAMENT_POS_UNLOADED:
+            elif force_unload is None and self.mmu.filament_pos != self.mmu.FILAMENT_POS_UNLOADED:
                 # Automatic unload case
                 self.mmu.unload_sequence()
             self._home_selector()
@@ -492,7 +492,7 @@ class LinearSelector:
             else:
                 self.bypass_offset = round(traveled, 1)
                 extrapolate = False
-                self.mmu.save_variable(self.mmu.VARS_MMU_SELECTOR_BYPASS, self.mmu.bypass_offset, write=True)
+                self.mmu.save_variable(self.VARS_MMU_SELECTOR_BYPASS, self.bypass_offset, write=True)
 
             if extrapolate:
                 self.mmu.log_always("All selector offsets have been extrapolated and saved:\n%s" % self.selector_offsets)

@@ -215,7 +215,7 @@ check_klipper() {
             fi
         else
             # There is no systemd on MIPS, we can only check the running processes
-            running_klipper_pid=$(ps -o pid,comm,args | grep [^]]/usr/share/klipper/klippy/klippy.py | awk '{print $1}')
+            running_klipper_pid=$(ps -o pid,comm,args | grep [^]]/klipper/klippy/klippy.py | awk '{print $1}')
             KLIPPER_PID_FILE=/var/run/klippy.pid
 
             if [ $(cat $KLIPPER_PID_FILE) = $running_klipper_pid ]; then
@@ -456,7 +456,7 @@ read_previous_mmu_type() {
     HAS_SERVO="yes"
     dest_cfg="${KLIPPER_CONFIG_HOME}/mmu/base/mmu_hardware.cfg"
     if [ -f "${dest_cfg}" ]; then
-        if ! grep -q "^\[mmu_servo selector_servo\]" "${dest_cfg}"; then
+        if ! grep -q "^\[mmu_servo selector_servo\]" "${dest_cfg}" && ! grep -q "^\[mmu_servo mmu_servo\]" "${dest_cfg}"; then
             HAS_SERVO="no"
         fi
     fi
@@ -1080,6 +1080,9 @@ uninstall_update_manager() {
         else
             cat "${file}" | sed -e " \
                 /\[mmu_server\]/,+1 d; \
+                /enable_file_preprocessor/ d; \
+                /enable_toolchange_next_pos/ d; \
+                /update_spoolman_location/ d; \
                     " > "${file}.new" && mv "${file}.new" "${file}"
             restart=1
         fi
@@ -1897,6 +1900,7 @@ questionaire() {
     echo "        * Configure your operational preferences in mmu_macro_vars.cfg"
     echo 
     echo "    Good luck! MMU is complex to setup. Remember Discord is your friend.."
+    echo -e "    Join the dedicated Happy Hare forum here: ${EMPHASIZE}https://discord.gg/98TYYUf6f2${INFO}"
     echo
     echo "    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^"
     echo

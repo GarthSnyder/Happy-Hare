@@ -246,7 +246,6 @@ class Mmu:
         self.filament_remaining = 0.
         self._last_tool = self._next_tool = self.TOOL_GATE_UNKNOWN
         self._next_gate = None
-        self._toolhead_max_accel = self.config.getsection('printer').getsection('toolhead').getint('max_accel', 5000)
         self.internal_test = False # True while running QA tests
         self.toolchange_retract = 0. # Set from mmu_macro_vars
         self._can_write_variables = True
@@ -402,6 +401,11 @@ class Mmu:
         self.extruder_homing_speed = config.getfloat('extruder_homing_speed', 15, minval=1.)
 
         self.gear_buzz_accel = config.getfloat('gear_buzz_accel', 1000, minval=10.) # Not exposed
+
+        self.macro_toolhead_max_accel = config.getfloat('macro_toolhead_max_accel', 0, minval=0)
+        self.macro_toolhead_min_cruise_ratio = config.getfloat('macro_toolhead_min_cruise_ratio', minval=0., below=1.)
+        if self.macro_toolhead_max_accel == 0:
+            self.macro_toolhead_max_accel = config.getsection('printer').getsection('toolhead').getint('max_accel', 5000)
 
         # Optional features
         self.espooler_min_distance = config.getfloat('espooler_min_distance', 50., above=0) # Not exposed
@@ -709,11 +713,16 @@ class Mmu:
         self.extruder_default_run_current = self.extruder_tmc.get_status(0)['run_current'] if self.extruder_tmc else None
         self.gear_percentage_run_current = self.gear_restore_percent_run_current = self.extruder_percentage_run_current = 100.
 
-        # Use gc to find all TMC current helpers - used for direct stepper current control
+        # Use gc to find all active TMC current helpers - used for direct stepper current control
         self.tmc_current_helpers = {}
+        refcounts = {}
         for obj in gc.get_objects():
-            if isinstance(obj, TMCCommandHelper) and sys.getrefcount(obj) > 2:
-                self.tmc_current_helpers[obj.stepper_name] = obj.current_helper
+            if isinstance(obj, TMCCommandHelper):
+                ref_count = sys.getrefcount(obj)
+                stepper_name = obj.stepper_name
+                if stepper_name not in refcounts or ref_count > refcounts[stepper_name]:
+                    refcounts[stepper_name] = ref_count
+                    self.tmc_current_helpers[stepper_name] = obj.current_helper
 
         # Sanity check that required klipper options are enabled
         self.print_stats = self.printer.lookup_object("print_stats", None)
@@ -975,6 +984,7 @@ class Mmu:
         self.form_tip_vars = None # Current defaults of gcode variables for tip forming macro
         self._clear_slicer_tool_map()
         self.pending_spool_id = None # For automatic assignment of spool_id if set perhaps by rfid reader
+        self.saved_toolhead_max_accel = None
 
         # Sub components
         self.selector.reinit()
@@ -1201,10 +1211,12 @@ class Mmu:
             self.gate_status = self._validate_gate_status(self.gate_status)
 
             # Sanity check filament pos based only on non-intrusive tests and recover if necessary
-            if (
+            if self.sensor_manager.check_all_sensors_after(self.FILAMENT_POS_END_BOWDEN, self.gate_selected):
+                self._set_filament_pos_state(self.FILAMENT_POS_LOADED, silent=True)
+            elif (
                 (self.filament_pos == self.FILAMENT_POS_LOADED and self.sensor_manager.check_any_sensors_after(self.FILAMENT_POS_END_BOWDEN, self.gate_selected) is False) or
                 (self.filament_pos == self.FILAMENT_POS_UNLOADED and self.sensor_manager.check_any_sensors_in_path()) or
-                self.filament_pos == self.FILAMENT_POS_UNKNOWN
+                self.filament_pos not in [self.FILAMENT_POS_LOADED, self.FILAMENT_POS_UNLOADED]
             ):
                 self.recover_filament_pos(can_heat=False, message=True, silent=True)
 
@@ -1212,7 +1224,7 @@ class Mmu:
             if self.startup_reset_ttg_map:
                 self._reset_ttg_map()
 
-            if self.startup_home_if_unloaded and self.check_if_not_calibrated(self.CALIBRATED_SELECTOR) and self.filament_pos == self.FILAMENT_POS_UNLOADED:
+            if self.startup_home_if_unloaded and not self.check_if_not_calibrated(self.CALIBRATED_SELECTOR) and self.filament_pos == self.FILAMENT_POS_UNLOADED:
                 self.home(0)
 
             if self.log_startup_status:
@@ -3114,7 +3126,11 @@ class Mmu:
                 self.log_debug("Saving toolhead gcode state and position (%s) for %s" % (toolhead_gcode_pos, operation))
                 self.gcode.run_script_from_command("SAVE_GCODE_STATE NAME=%s" % self.TOOLHEAD_POSITION_STATE)
                 self.saved_toolhead_operation = operation
+
+                # Save toolhead velocity limits and set user defined for macros
                 self.saved_toolhead_max_accel = self.toolhead.max_accel
+                self.saved_toolhead_min_cruise_ratio = self.toolhead.min_cruise_ratio
+                self.gcode.run_script_from_command("SET_VELOCITY_LIMIT ACCEL=%.6f MINIMUM_CRUISE_RATIO=%.6f" % (self.macro_toolhead_max_accel, self.macro_toolhead_min_cruise_ratio))
 
                 # Record the intended X,Y resume position (this is also passed to the pause/resume restore position in pause is later called)
                 if next_pos:
@@ -3166,15 +3182,18 @@ class Mmu:
                         travel_speed = sequence_vars_macro.variables.get('park_travel_speed', travel_speed)
                     gcode_pos = self.gcode_move.saved_states[self.TOOLHEAD_POSITION_STATE]['last_position']
                     display_gcode_pos = " ".join(["%s:%.1f" % (a, v) for a, v in zip("XYZE", gcode_pos)])
-                    self.gcode.run_script_from_command("M204 S%d" % self.saved_toolhead_max_accel)
                     self.gcode.run_script_from_command("RESTORE_GCODE_STATE NAME=%s MOVE=1 MOVE_SPEED=%.1f" % (self.TOOLHEAD_POSITION_STATE, travel_speed))
                     self.log_debug("Ensuring correct gcode state and position (%s) after %s" % (display_gcode_pos, operation))
                     self._clear_saved_toolhead_position()
-                    return
                 else:
                     # Special case of not restoring so just clear all saved state
                     self._clear_macro_state()
                     self._clear_saved_toolhead_position()
+
+                # Always restore toolhead velocity limits
+                if self.saved_toolhead_max_accel:
+                    self.gcode.run_script_from_command("SET_VELOCITY_LIMIT ACCEL=%.6f MINIMUM_CRUISE_RATIO=%.6f" % (self.saved_toolhead_max_accel, self.saved_toolhead_min_cruise_ratio))
+                    self.saved_toolhead_max_accel = None
             else:
                 pass # Resume will call here again shortly so we can ignore for now
         else:
@@ -3184,7 +3203,6 @@ class Mmu:
 
     def _clear_saved_toolhead_position(self):
         self.saved_toolhead_operation = ''
-        self.saved_toolhead_max_accel = 0
 
     def _disable_runout(self):
         enabled = self.runout_enabled
@@ -3348,7 +3366,7 @@ class Mmu:
 
     def check_if_not_homed(self):
         if not self.selector.is_homed:
-            self.log_error("Operation not possible. MMU is not homed")
+            self.log_error("Operation not possible. MMU selector is not homed")
             return True
         return False
 
@@ -3995,6 +4013,7 @@ class Mmu:
                 endstop_name = self._get_gate_endstop_name()
                 msg = ("Initial homing to %s sensor" % endstop_name) if i == 0 else ("Retry homing to gate sensor (retry #%d)" % i)
                 actual,homed,measured,_ = self.trace_filament_move(msg, self.gate_homing_max, motor="gear", homing_move=1, endstop_name=endstop_name)
+                #homed = True # PAUL for a test
                 if homed:
                     self.log_debug("Endstop %s reached after %.1fmm (measured %.1fmm)" % (endstop_name, actual, measured))
                     self._set_gate_status(self.gate_selected, max(self.gate_status[self.gate_selected], self.GATE_AVAILABLE)) # Don't reset if filament is buffered
@@ -4057,6 +4076,7 @@ class Mmu:
                 else:
                     self.log_trace("Unloading gate using the encoder")
                 success = self._reverse_home_to_encoder(homing_max)
+                #success = True # PAUL for a test
                 if success:
                     actual,park,_ = success
                     _,_,measured,_ = self.trace_filament_move("Final parking", -park)
@@ -5164,6 +5184,8 @@ class Mmu:
         try:
             yield self
         finally:
+            #self.mmu_toolhead.flush_step_generation() # TTC mitigation PAUL
+            #self.toolhead.flush_step_generation()     # TTC mitigation PAUL
             self._wait_for_espooler = False
             if active and self.espooler_stop_macro and self.espooler_stop_macro != "''":
                 moved = abs(self.mmu_toolhead.get_position()[1] - initial_pos)
@@ -5420,8 +5442,10 @@ class Mmu:
             except Exception as e:
                 # Fallback
                 self.log_debug("Unexpected error setting stepper current: %s. Falling back to default approach" % str(e))
+                self.log_info(msg.format(run_current))
                 self.gcode.run_script_from_command("SET_TMC_CURRENT STEPPER=%s CURRENT=%.2f" % (stepper, run_current))
         else:
+            self.log_info(msg.format(run_current))
             self.gcode.run_script_from_command("SET_TMC_CURRENT STEPPER=%s CURRENT=%.2f" % (stepper, run_current))
 
     @contextlib.contextmanager
@@ -5568,7 +5592,7 @@ class Mmu:
 
     def _auto_home(self, tool=0):
         if not self.selector.is_homed or self.tool_selected == self.TOOL_GATE_UNKNOWN:
-            self.log_info("MMU not homed, will home before continuing")
+            self.log_info("MMU selector not homed, will home before continuing")
             self.home(tool)
         elif self.filament_pos == self.FILAMENT_POS_UNKNOWN and self.selector.is_homed:
             self.recover_filament_pos(message=True)
@@ -6356,6 +6380,7 @@ class Mmu:
                     self._set_gate_selected(self.TOOL_GATE_BYPASS)
                     self._set_tool_selected(self.TOOL_GATE_BYPASS)
                     self._ensure_ttg_match()
+
                 elif tool >= 0: # If tool is specified then use and optionally override the gate
                     self._set_tool_selected(tool)
                     gate = self.ttg_map[tool]
@@ -6364,7 +6389,13 @@ class Mmu:
                     if gate >= 0:
                         self.selector.restore_gate(gate)
                         self._set_gate_selected(gate)
+                        self.log_info("Remapping T%d to gate %d" % (tool, gate))
                         self._remap_tool(tool, gate, loaded)
+
+                elif mod_gate >= 0: # If only gate specified then just reset and ensure tool is correct
+                    self._set_gate_selected(mod_gate)
+                    self._ensure_ttg_match()
+
                 elif tool == self.TOOL_GATE_UNKNOWN and self.tool_selected == self.TOOL_GATE_BYPASS and loaded == -1:
                     # This is to be able to get out of "stuck in bypass" state
                     self.log_info("Warning: Making assumption that bypass is unloaded")
