@@ -16,19 +16,19 @@ import gc, sys, ast, random, logging, time, contextlib, math, os.path, re, unico
 
 # Klipper imports
 import chelper
-from extras.homing import Homing, HomingMove
-from extras.tmc import TMCCommandHelper
+from ..homing            import Homing, HomingMove
+from ..tmc               import TMCCommandHelper
 
 # Happy Hare imports
-from extras              import mmu_machine
-from extras.mmu_machine  import MmuToolHead
-from extras.mmu_leds     import MmuLeds
-from extras.mmu_sensors  import MmuRunoutHelper
+from ..                  import mmu_machine
+from ..mmu_machine       import MmuToolHead
+from ..mmu_leds          import MmuLeds
+from ..mmu_sensors       import MmuRunoutHelper
 
 # MMU subcomponent clases
 from .mmu_shared         import *
 from .mmu_logger         import MmuLogger
-from .mmu_selector       import VirtualSelector, LinearSelector, RotarySelector
+from .mmu_selector       import VirtualSelector, LinearSelector, MacroSelector, RotarySelector
 from .mmu_test           import MmuTest
 from .mmu_utils          import DebugStepperMovement, PurgeVolCalculator
 from .mmu_sensor_manager import MmuSensorManager
@@ -262,6 +262,9 @@ class Mmu:
         if self.config_version is not None and self.config_version < self.VERSION:
             raise self.config.error("Looks like you upgraded (v%s -> v%s)?\n%s" % (self.config_version, self.VERSION, self.UPGRADE_REMINDER))
 
+        # Detect Kalico (Danger Klipper) installation
+        self.kalico = bool(self.printer.lookup_object('danger_options', False))
+
         # Setup remaining hardware like MMU toolhead --------------------------------------------------------
         #
         # By default HH uses its modified homing extruder. Because this might have unknown consequences on certain
@@ -420,6 +423,8 @@ class Mmu:
         self.default_endless_spool_groups = list(config.getintlist('endless_spool_groups', []))
         self.tool_extrusion_multipliers = []
         self.tool_speed_multipliers = []
+        self.select_tool_macro = config.get('select_tool_macro', default=None)
+        self.select_tool_num_switches = config.getint('select_tool_num_switches', default=0, minval=0)
 
         # Logging
         self.log_level = config.getint('log_level', 1, minval=0, maxval=4)
@@ -1062,7 +1067,7 @@ class Mmu:
         weighted_euclidean_distance = lambda color1, color2, weights=(0.3, 0.59, 0.11): (
             sum(weights[i] * (a - b) ** 2 for i, (a, b) in enumerate(zip(color1, color2)))
         )
-        ref_rgb = self._color_to_rgb_tuple(ref_color, fraction=False)
+        ref_rgb = self._color_to_rgb_tuple(ref_color)
         min_distance = float('inf')
         closest_color = None
         for color in color_list:
@@ -1205,6 +1210,8 @@ class Mmu:
             # Splash...
             msg = '{1}(\_/){0}\n{1}( {0}*,*{1}){0}\n{1}(")_("){0} {5}{2}H{0}{3}a{0}{4}p{0}{2}p{0}{3}y{0} {4}H{0}{2}a{0}{3}r{0}{4}e{0} {1}%s{0} {2}R{0}{3}e{0}{4}a{0}{2}d{0}{3}y{0}{1}...{0}{6}' % fversion(self.config_version)
             self.log_always(msg, color=True)
+            if self.kalico:
+                self.log_error("Warning: You are running on Kalico (Danger-Klipper). Support is not guaranteed!")
             self._set_print_state("initialized")
 
             # Use pre-gate sensors to adjust gate map
@@ -2035,6 +2042,7 @@ class Mmu:
                 se = stepper_enable.lookup_enable(stepper.get_name())
                 se.motor_disable(self.mmu_toolhead.get_last_move_time())
         if motor in ["all", "selector"]:
+            self.selector.restore_gate(self.TOOL_GATE_UNKNOWN)
             self._set_gate_selected(self.TOOL_GATE_UNKNOWN)
             self._set_tool_selected(self.TOOL_GATE_UNKNOWN)
             self.selector.disable_motors()
@@ -2083,8 +2091,7 @@ class Mmu:
         grip = gcmd.get_int('GRIP', 1, minval=0, maxval=1)
         servo = gcmd.get_int('SERVO', 1, minval=0, maxval=1) # Deprecated (use GRIP=0 instead)
         sync = gcmd.get_int('SYNC', 1, minval=0, maxval=1)
-        force_in_print = bool(gcmd.get_int('FORCE_IN_PRINT', 0, minval=0, maxval=1)) # Mimick in-print current
-        self.sync_gear_to_extruder(sync, grip=(grip and servo), current=self.is_in_print(force_in_print))
+        self.sync_gear_to_extruder(sync, grip=(grip and servo), current=True)
 
 
 #########################
@@ -3129,8 +3136,11 @@ class Mmu:
 
                 # Save toolhead velocity limits and set user defined for macros
                 self.saved_toolhead_max_accel = self.toolhead.max_accel
-                self.saved_toolhead_min_cruise_ratio = self.toolhead.min_cruise_ratio
-                self.gcode.run_script_from_command("SET_VELOCITY_LIMIT ACCEL=%.6f MINIMUM_CRUISE_RATIO=%.6f" % (self.macro_toolhead_max_accel, self.macro_toolhead_min_cruise_ratio))
+                self.saved_toolhead_min_cruise_ratio = self.toolhead.get_status(eventtime).get('minimum_cruise_ratio', None)
+                cmd = "SET_VELOCITY_LIMIT ACCEL=%.6f" % self.macro_toolhead_max_accel
+                if self.saved_toolhead_min_cruise_ratio is not None:
+                    cmd += " MINIMUM_CRUISE_RATIO=%.6f" % self.macro_toolhead_min_cruise_ratio
+                self.gcode.run_script_from_command(cmd)
 
                 # Record the intended X,Y resume position (this is also passed to the pause/resume restore position in pause is later called)
                 if next_pos:
@@ -3192,7 +3202,10 @@ class Mmu:
 
                 # Always restore toolhead velocity limits
                 if self.saved_toolhead_max_accel:
-                    self.gcode.run_script_from_command("SET_VELOCITY_LIMIT ACCEL=%.6f MINIMUM_CRUISE_RATIO=%.6f" % (self.saved_toolhead_max_accel, self.saved_toolhead_min_cruise_ratio))
+                    cmd = "SET_VELOCITY_LIMIT ACCEL=%.6f" % self.saved_toolhead_max_accel
+                    if self.saved_toolhead_min_cruise_ratio is not None:
+                        cmd += " MINIMUM_CRUISE_RATIO=%.6f" % self.saved_toolhead_min_cruise_ratio
+                    self.gcode.run_script_from_command(cmd)
                     self.saved_toolhead_max_accel = None
             else:
                 pass # Resume will call here again shortly so we can ignore for now
@@ -4013,7 +4026,6 @@ class Mmu:
                 endstop_name = self._get_gate_endstop_name()
                 msg = ("Initial homing to %s sensor" % endstop_name) if i == 0 else ("Retry homing to gate sensor (retry #%d)" % i)
                 actual,homed,measured,_ = self.trace_filament_move(msg, self.gate_homing_max, motor="gear", homing_move=1, endstop_name=endstop_name)
-                #homed = True # PAUL for a test
                 if homed:
                     self.log_debug("Endstop %s reached after %.1fmm (measured %.1fmm)" % (endstop_name, actual, measured))
                     self._set_gate_status(self.gate_selected, max(self.gate_status[self.gate_selected], self.GATE_AVAILABLE)) # Don't reset if filament is buffered
@@ -4076,7 +4088,6 @@ class Mmu:
                 else:
                     self.log_trace("Unloading gate using the encoder")
                 success = self._reverse_home_to_encoder(homing_max)
-                #success = True # PAUL for a test
                 if success:
                     actual,park,_ = success
                     _,_,measured,_ = self.trace_filament_move("Final parking", -park)
@@ -4734,7 +4745,7 @@ class Mmu:
                 self._display_visual_state()
 
             park_pos = 0.
-            form_tip = form_tip if not None else self.FORM_TIP_STANDALONE
+            form_tip = form_tip if form_tip is not None else self.FORM_TIP_STANDALONE
             if form_tip == self.FORM_TIP_SLICER:
                 # Slicer was responsible for the tip, but the user must set the slicer_tip_park_pos
                 park_pos = self.slicer_tip_park_pos
@@ -4912,8 +4923,7 @@ class Mmu:
             with self._wrap_pressure_advance(0., "for tip forming"):
                 gcode_macro = self.printer.lookup_object("gcode_macro %s" % self.form_tip_macro, "_MMU_FORM_TIP")
                 self.log_info("Forming tip...")
-                self._wrap_gcode_command("%s %s" % (self.form_tip_macro, "FINAL_EJECT=1" if test else ""), exception=True)
-                self.movequeues_wait()
+                self._wrap_gcode_command("%s %s" % (self.form_tip_macro, "FINAL_EJECT=1" if test else ""), exception=True, wait=True)
 
             final_mcu_pos = self.mmu_extruder_stepper.stepper.get_mcu_position()
             stepper_movement = (initial_mcu_pos - final_mcu_pos) * self.mmu_extruder_stepper.stepper.get_step_dist()
@@ -5184,8 +5194,6 @@ class Mmu:
         try:
             yield self
         finally:
-            #self.mmu_toolhead.flush_step_generation() # TTC mitigation PAUL
-            #self.toolhead.flush_step_generation()     # TTC mitigation PAUL
             self._wait_for_espooler = False
             if active and self.espooler_stop_macro and self.espooler_stop_macro != "''":
                 moved = abs(self.mmu_toolhead.get_position()[1] - initial_pos)
@@ -5329,10 +5337,12 @@ class Mmu:
     # grip: True=grip/release, False=don't mess
     # current: True=optionally reduce, False=restore to current default
     def sync_gear_to_extruder(self, sync, gate=None, grip=False, current=False):
+        #self.log_error("PAUL TEMP: sync_gear_to_extruder(sync=%s, gate=%s, grip=%s, current=%s)" % (sync, gate, grip, current))
 
         # Safety in case somehow called with bypass/unknown selected. Usually this is called after
         # self.gate_selected is set, but can be before on type-B designs hence optional gate parameter
-        if (gate or self.gate_selected) < 0:
+        gate = gate if gate is not None else self.gate_selected
+        if gate < 0:
             sync = current = False
         elif self.mmu_machine.filament_always_gripped:
             sync = current = True
@@ -5349,12 +5359,15 @@ class Mmu:
             self.movequeues_wait() # Safety but should not be required(?)
             self.mmu_toolhead.sync(new_sync_mode)
 
-        # Set gear current (not supported for multi-gear designs)
-        if not self.mmu_machine.multigear:
-            if current and sync:
-                self._adjust_gear_current(self.sync_gear_current, "for extruder syncing")
-            else:
+        # See if we need to set a reduced gear current. If we do then make sure it is
+        # restored on previous gear stepper if we are on a multigear MMU
+        if current and sync:
+            # Reset current on old gear stepper before adjusting new
+            if self.mmu_machine.multigear and gate != self.gate_selected:
                 self._restore_gear_current()
+            self._adjust_gear_current(gate=gate, percent=self.sync_gear_current, reason="for extruder syncing")
+        else:
+            self._restore_gear_current()
 
     # This is used to protect the in print synchronization state and is used as an outermost wrapper for calls back
     # into Happy Hare during a print. It also ensures that grip (e.g. servo) and current are correctly restored
@@ -5366,7 +5379,10 @@ class Mmu:
         try:
             yield self
         finally:
-            self.sync_gear_to_extruder(prev_sync, grip=prev_grip != self.selector.get_filament_grip_state(), current=prev_current)
+            if self.gate_selected >= 0:
+                self.sync_gear_to_extruder(prev_sync, grip=prev_grip != self.selector.get_filament_grip_state(), current=prev_current)
+            else:
+                self.sync_gear_to_extruder(False, grip=True, current=False)
 
     # This is used to protect just the mmu_toolhead sync state and is used to wrap individual moves. Typically
     # the starting state will be unsynced so this will simply unsync at the end of the move. It does not manage
@@ -5381,28 +5397,30 @@ class Mmu:
         finally:
             self.mmu_toolhead.sync(prev_sync_mode)
 
-    def _adjust_gear_current(self, percent=100, reason=""):
-        if self.gear_tmc and 0 < percent < 200 and percent != self.gear_percentage_run_current:
-            gear_stepper_name = mmu_machine.GEAR_STEPPER_CONFIG
-            if self.mmu_machine.multigear and self.gate_selected > 0:
-                gear_stepper_name = "%s_%d" % (mmu_machine.GEAR_STEPPER_CONFIG, self.gate_selected)
-            msg = "Modifying MMU gear stepper run current to %d%% ({:.2f}A) %s" % (percent, reason)
-            self._set_tmc_current(gear_stepper_name, (self.gear_default_run_current * percent) / 100., msg)
-            self.gear_percentage_run_current = percent
+    def _adjust_gear_current(self, gate=None, percent=100, reason=""):
+        gate = gate if gate is not None else self.gate_selected
+        if gate >= 0:
+            if self.gear_tmc and 0 < percent < 200 and percent != self.gear_percentage_run_current:
+                gear_stepper_name = mmu_machine.GEAR_STEPPER_CONFIG
+                if self.mmu_machine.multigear and gate > 0:
+                    gear_stepper_name = "%s_%d" % (mmu_machine.GEAR_STEPPER_CONFIG, gate)
+                msg = "Modifying MMU %s run current to %d%% ({:.2f}A) %s" % (gear_stepper_name, percent, reason)
+                self._set_tmc_current(gear_stepper_name, (self.gear_default_run_current * percent) / 100., msg)
+                self.gear_percentage_run_current = percent
 
     def _restore_gear_current(self):
         if self.gear_tmc and self.gear_percentage_run_current != self.gear_restore_percent_run_current:
             gear_stepper_name = mmu_machine.GEAR_STEPPER_CONFIG
             if self.mmu_machine.multigear and self.gate_selected > 0:
                 gear_stepper_name = "%s_%d" % (mmu_machine.GEAR_STEPPER_CONFIG, self.gate_selected)
-            msg = "Restoring MMU gear stepper run current to %d%% configured ({:.2f}A)" % self.gear_restore_percent_run_current
+            msg = "Restoring MMU %s run current to %d%% ({:.2f}A)" % (gear_stepper_name, self.gear_restore_percent_run_current)
             self._set_tmc_current(gear_stepper_name, self.gear_default_run_current, msg)
             self.gear_percentage_run_current = self.gear_restore_percent_run_current
 
     @contextlib.contextmanager
     def _wrap_gear_current(self, percent=100, reason=""):
         self.gear_restore_percent_run_current = self.gear_percentage_run_current
-        self._adjust_gear_current(percent, reason)
+        self._adjust_gear_current(percent=percent, reason=reason)
         try:
             yield self
         finally:
@@ -5425,7 +5443,7 @@ class Mmu:
 
     def _restore_extruder_current(self):
         if self.extruder_tmc and self.extruder_percentage_run_current != 100:
-            msg="Restoring extruder stepper run current to 100% configured ({:.2f}A)"
+            msg="Restoring extruder stepper run current to 100% ({:.2f}A)"
             self._set_tmc_current(self.extruder_name, self.extruder_default_run_current, msg)
             self.extruder_percentage_run_current = 100
 
@@ -5438,14 +5456,14 @@ class Mmu:
                 prev_cur, prev_hold_cur, req_hold_cur, max_cur = current_helper.get_current()
                 new_cur = max(min(run_current, max_cur), 0)
                 current_helper.set_current(new_cur, req_hold_cur, print_time)
-                self.log_info(msg.format(new_cur))
+                self.log_debug(msg.format(new_cur))
             except Exception as e:
                 # Fallback
                 self.log_debug("Unexpected error setting stepper current: %s. Falling back to default approach" % str(e))
-                self.log_info(msg.format(run_current))
+                self.log_debug(msg.format(run_current))
                 self.gcode.run_script_from_command("SET_TMC_CURRENT STEPPER=%s CURRENT=%.2f" % (stepper, run_current))
         else:
-            self.log_info(msg.format(run_current))
+            self.log_debug(msg.format(run_current))
             self.gcode.run_script_from_command("SET_TMC_CURRENT STEPPER=%s CURRENT=%.2f" % (stepper, run_current))
 
     @contextlib.contextmanager
@@ -5587,7 +5605,7 @@ class Mmu:
         self.log_debug("Unloading tool %s" % self._selected_tool_string())
         self._set_last_tool(self.tool_selected)
         self._record_tool_override() # Remember M220 and M221 overrides
-        self.unload_sequence(form_tip=form_tip if not None else self.FORM_TIP_STANDALONE, runout=runout)
+        self.unload_sequence(form_tip=form_tip, runout=runout)
         self._spoolman_activate_spool(0) # Deactivate in SpoolMan
 
     def _auto_home(self, tool=0):
@@ -6169,7 +6187,7 @@ class Mmu:
 
         try:
             with self.wrap_sync_gear_to_extruder():
-                with self._wrap_suspend_runout(): # Don't want runout accidently triggering during filament load
+                with self._wrap_suspend_runout(): # Don't want runout accidently triggering during filament unload
                     self._mmu_unload_eject(gcmd)
         except MmuError as ee:
             self.handle_mmu_error("%s.\nOccured when unloading tool" % str(ee))
@@ -6205,18 +6223,19 @@ class Mmu:
 
         try:
             with self.wrap_sync_gear_to_extruder():
-                current_gate = self.gate_selected
-                self.select_gate(gate)
-                self._mmu_unload_eject(gcmd)
-                if can_eject_from_gate:
-                    self.log_always("Ejecting filament out of %s" % ("current gate" if gate == self.gate_selected else "gate %d" % gate))
-                    self._eject_from_gate()
-                # If necessary or easy restore previous gate
-                if self.is_in_print() or self.mmu_machine.multigear:
-                    self.select_gate(current_gate)
-                else:
-                    self._initialize_encoder() # Encoder 0000
-                    self._auto_filament_grip()
+                with self._wrap_suspend_runout(): # Don't want runout accidently triggering during filament eject
+                    current_gate = self.gate_selected
+                    self.select_gate(gate)
+                    self._mmu_unload_eject(gcmd)
+                    if can_eject_from_gate:
+                        self.log_always("Ejecting filament out of %s" % ("current gate" if gate == self.gate_selected else "gate %d" % gate))
+                        self._eject_from_gate()
+                    # If necessary or easy restore previous gate
+                    if self.is_in_print() or self.mmu_machine.multigear:
+                        self.select_gate(current_gate)
+                    else:
+                        self._initialize_encoder() # Encoder 0000
+                        self._auto_filament_grip()
         except MmuError as ee:
             self.handle_mmu_error("Filament eject for gate %d failed: %s" % (gate, str(ee)))
 
@@ -6393,6 +6412,7 @@ class Mmu:
                         self._remap_tool(tool, gate, loaded)
 
                 elif mod_gate >= 0: # If only gate specified then just reset and ensure tool is correct
+                    self.selector.restore_gate(mod_gate)
                     self._set_gate_selected(mod_gate)
                     self._ensure_ttg_match()
 
@@ -7153,16 +7173,16 @@ class Mmu:
                     color_list = []
                     for gn, color in enumerate(search_in):
                         gm = "".join(self.gate_material[gn].strip()).replace('#', '').lower()
-                        if gm == tool_to_remap['material']:
+                        if gm == tool_to_remap['material'].lower():
                             color_list.append(color)
                     if not color_list:
-                        errors.append("Gates with %s are mssing color information..." % tool_to_remap['material'])
+                        errors.append("Gates with %s are missing color information..." % tool_to_remap['material'])
 
                 if not errors:
                     closest, distance = self._find_closest_color(tool_to_remap['color'], color_list)
                     for gn, color in enumerate(search_in):
                         gm = "".join(self.gate_material[gn].strip()).replace('#', '').lower()
-                        if gm == tool_to_remap['material']:
+                        if gm == tool_to_remap['material'].lower():
                             if closest == color:
                                 t = self.console_gate_stat
                                 if distance > 0.5:
@@ -7825,7 +7845,6 @@ class Mmu:
                         with self.wrap_action(self.ACTION_CHECKING):
                             tool_selected = self.tool_selected
                             filament_pos = self.filament_pos
-                            self._set_tool_selected(self.TOOL_GATE_UNKNOWN)
                             gates_tools = []
                             if gate >= 0:
                                 # Individual gate
@@ -7875,6 +7894,7 @@ class Mmu:
                             if len(gates_tools) > 1:
                                 self.log_info("Will check gates: %s" % ', '.join(str(g) for g,t in gates_tools))
                             with self.wrap_suppress_visual_log():
+                                self._set_tool_selected(self.TOOL_GATE_UNKNOWN)
                                 for gate, tool in gates_tools:
                                     try:
                                         self.select_gate(gate)

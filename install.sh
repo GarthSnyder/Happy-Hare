@@ -163,7 +163,10 @@ self_update() {
 
     if [ -n "${RESTART}" ]; then
         git checkout $BRANCH --quiet
-        git pull --quiet --force
+        if git symbolic-ref -q HEAD > /dev/null; then
+            # On a branch (if using tags we will be detached)
+            git pull --quiet --force
+        fi
         GIT_VER=$(git describe --tags)
         echo -e "${B_GREEN}Now on git version ${GIT_VER}"
         echo -e "${B_GREEN}Running the new install script..."
@@ -543,17 +546,19 @@ read_previous_config() {
     if [ ! "${variable_lift_speed}" == "" ]; then
         variable_park_lift_speed="${variable_lift_speed}"
     fi
+
     if [ "${variable_enable_park}" == "False" ]; then
         variable_enable_park_printing="'pause,cancel'"
         if [ "${variable_enable_park_runout}" == "True" ]; then
             variable_enable_park_printing="'toolchange,load,unload,runout,pause,cancel'"
         fi
-    else
+    elif [ "${variable_enable_park_printing}" == "" ]; then
         variable_enable_park_printing="'toolchange,load,unload,pause,cancel'"
     fi
+
     if [ "${variable_enable_park_standalone}" == "False" ]; then
         variable_enable_park_standalone="'pause,cancel'"
-    else
+    elif [ "${variable_enable_park_standalone}" == "" ]; then
         variable_enable_park_standalone="'toolchange,load,unload,pause,cancel'"
     fi
 
@@ -1387,7 +1392,7 @@ questionaire() {
             _hw_gear_run_current=0.7
             _hw_gear_hold_current=0.1
             _param_extruder_homing_endstop="none"
-            _param_gate_homing_endstop="mmu_gate"
+            _param_gate_homing_endstop="mmu_gear"
             _param_gate_parking_distance=100
             _param_gate_final_eject_distance=100
 
